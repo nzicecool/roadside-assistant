@@ -31,6 +31,8 @@ class _SourceResponse:
 
 
 class _GeminiResponse:
+    status_code = 200
+
     def raise_for_status(self):
         return None
 
@@ -85,6 +87,23 @@ class RoadsideAssistantTests(unittest.TestCase):
             body = self.client.post("/chat", json={"message": "What number do I call?"}).json()
         self.assertEqual(body["response"], "Call 13 11 11 for roadside help.")
         self.assertEqual(body["source"], main.SOURCE_URL)
+
+    def test_chat_reports_rate_limited_model_after_retry(self):
+        class _Throttled:
+            status_code = 429
+
+            def raise_for_status(self):
+                raise AssertionError("429 must be handled before raise_for_status")
+
+            def json(self):
+                return {}
+
+        with patch("httpx.get", return_value=_SourceResponse(SOURCE_HTML)), patch(
+            "httpx.post", return_value=_Throttled()
+        ), patch("time.sleep", return_value=None):
+            response = self.client.post("/chat", json={"message": "Any cover?"})
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("rate limited", response.json()["detail"])
 
     def test_chat_fails_closed_when_source_is_down(self):
         with patch("httpx.get", return_value=_SourceResponse("blocked", status_code=503)):

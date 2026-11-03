@@ -77,6 +77,10 @@ class ApprovedSourceUnavailable(RuntimeError):
     """Raised when the only approved source cannot be safely retrieved."""
 
 
+class ModelUnavailable(RuntimeError):
+    """Raised when the managed model stays throttled after a retry."""
+
+
 def _cache_ttl_seconds() -> int:
     try:
         return min(3_600, max(60, int(os.getenv("RAA_SOURCE_TTL_SECONDS", "900"))))
@@ -195,17 +199,42 @@ def generate_gemini_response(question: str, source: str) -> tuple[str, int, int]
         span.set_attribute("gen_ai.input.messages", _redacted_trace_messages(messages))
         span.set_attribute("app.source.url", SOURCE_URL)
         try:
-            response = httpx.post(
-                endpoint,
-                json=payload,
-                headers={"Content-Type": "application/json", "API-Key": api_key},
-                timeout=60.0,
-            )
+            response = None
+            for attempt in range(2):
+                response = httpx.post(
+                    endpoint,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "API-Key": api_key},
+                    timeout=60.0,
+                )
+                # The shared Gemini deployment throttles bursts (HTTP 429) and
+                # occasionally returns 5xx; one short retry usually clears it.
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt == 0:
+                        span.set_attribute("app.model.retry_status", response.status_code)
+                        time.sleep(4.0)
+                        continue
+                    raise ModelUnavailable(
+                        f"Managed Gemini model is busy (HTTP {response.status_code})"
+                    )
+                break
+            assert response is not None
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, dict):
                 raise ValueError("Gemini returned an invalid response")
             answer = _visible_gemini_text(body)
+        except ModelUnavailable as exc:
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR, "managed model unavailable"))
+            span.set_attribute("error.type", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The platform-managed Gemini model is rate limited right now. "
+                    "Please try again in a few seconds."
+                ),
+            ) from exc
         except (httpx.HTTPError, TypeError, ValueError, KeyError, IndexError) as exc:
             span.record_exception(exc)
             span.set_status(Status(StatusCode.ERROR, "Gemini request failed"))
