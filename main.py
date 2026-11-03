@@ -32,6 +32,24 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 roadside-assistant-agent/1.0"
 )
 
+# raa.com.au sits behind an edge that silently drops requests which do not look
+# like a browser navigation (a minimal User-Agent gets "Server disconnected"
+# instead of a response), so send a complete set of navigation headers.
+SOURCE_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Connection": "keep-alive",
+    "Accept-Encoding": "identity",
+}
+
 SYSTEM_PROMPT = f"""You are Roadside Assistant, a source-restricted RAA roadside-assistance assistant.
 Only look at and use this exact approved source: {SOURCE_URL}
 Answer only about RAA Road Service information that is explicitly stated on that exact page: cover levels and their prices, call-out allowances, attendance and towing limits, what is included or excluded, how to get help, and how to join, renew or check cover. Do not use any other webpages, links, sources, prior knowledge, or information about other motoring clubs or insurers. Do not invent, estimate, infer unstated details, or claim a price, fee, eligibility rule, benefit, timeframe or process that is not in the approved page content.
@@ -92,24 +110,35 @@ def get_approved_source() -> str:
     now = time.monotonic()
     if _source_cache and _source_cache.expires_at > now:
         return _source_cache.content
-    try:
-        response = httpx.get(
-            SOURCE_URL,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "en-AU,en;q=0.9"},
-            follow_redirects=False,
-            timeout=25.0,
-        )
-        if response.status_code != 200:
-            raise ApprovedSourceUnavailable(
-                f"Approved source returned HTTP {response.status_code}"
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        try:
+            response = httpx.get(
+                SOURCE_URL,
+                headers=SOURCE_HEADERS,
+                follow_redirects=False,
+                timeout=25.0,
             )
-        if response.url.host != SOURCE_HOST or response.url.path.rstrip("/") != SOURCE_PATH:
-            raise ApprovedSourceUnavailable("Approved source request resolved to an unapproved URL")
-        source = _extract_visible_text(response.text)
-    except (httpx.HTTPError, ApprovedSourceUnavailable) as exc:
-        if isinstance(exc, ApprovedSourceUnavailable):
+            if response.status_code != 200:
+                raise ApprovedSourceUnavailable(
+                    f"Approved source returned HTTP {response.status_code}"
+                )
+            if response.url.host != SOURCE_HOST or response.url.path.rstrip("/") != SOURCE_PATH:
+                raise ApprovedSourceUnavailable(
+                    "Approved source request resolved to an unapproved URL"
+                )
+            source = _extract_visible_text(response.text)
+            break
+        except ApprovedSourceUnavailable:
             raise
-        raise ApprovedSourceUnavailable("Approved source request failed") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            # the RAA edge occasionally closes the connection mid-body; retry
+            last_error = exc
+            continue
+    else:
+        raise ApprovedSourceUnavailable("Approved source request failed") from last_error
     _source_cache = _CachedSource(content=source, expires_at=now + _cache_ttl_seconds())
     return source
 
