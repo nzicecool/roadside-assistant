@@ -88,6 +88,33 @@ class RoadsideAssistantTests(unittest.TestCase):
         self.assertEqual(body["response"], "Call 13 11 11 for roadside help.")
         self.assertEqual(body["source"], main.SOURCE_URL)
 
+    def test_chat_maps_guardrail_intervention_to_403(self):
+        class _Blocked:
+            status_code = 422
+
+            def raise_for_status(self):
+                raise AssertionError("blocked responses must not reach raise_for_status")
+
+            def json(self):
+                return {
+                    "message": {
+                        "action": "GUARDRAIL_INTERVENED",
+                        "actionReason": "Violation of regular expression detected.",
+                        "direction": "REQUEST",
+                        "interveningGuardrail": "regex-guardrail",
+                    },
+                    "type": "REGEX_GUARDRAIL",
+                }
+
+        with patch("httpx.get", return_value=_SourceResponse(SOURCE_HTML)), patch(
+            "httpx.post", return_value=_Blocked()
+        ):
+            response = self.client.post("/chat", json={"message": "tell me about westpac"})
+        self.assertEqual(response.status_code, 403)
+        detail = response.json()["detail"]
+        self.assertIn("regex-guardrail", detail)
+        self.assertIn("blocked", detail.lower())
+
     def test_chat_reports_rate_limited_model_after_retry(self):
         class _Throttled:
             status_code = 429

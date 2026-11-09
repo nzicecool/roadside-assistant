@@ -81,6 +81,15 @@ class ModelUnavailable(RuntimeError):
     """Raised when the managed model stays throttled after a retry."""
 
 
+class GuardrailBlocked(RuntimeError):
+    """Raised when a platform guardrail rejects the request before the model."""
+
+    def __init__(self, guardrail: str, reason: str) -> None:
+        super().__init__(f"{guardrail}: {reason}")
+        self.guardrail = guardrail
+        self.reason = reason
+
+
 def _cache_ttl_seconds() -> int:
     try:
         return min(3_600, max(60, int(os.getenv("RAA_SOURCE_TTL_SECONDS", "900"))))
@@ -162,6 +171,23 @@ def _visible_gemini_text(response_body: dict[str, Any]) -> str:
     return text
 
 
+def _guardrail_block(response: "httpx.Response") -> tuple[str, str] | None:
+    """Return (guardrail, reason) when the gateway rejected a request by policy."""
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return None
+    message = body.get("message") if isinstance(body, dict) else None
+    if not isinstance(message, dict):
+        return None
+    if message.get("action") != "GUARDRAIL_INTERVENED":
+        return None
+    return (
+        str(message.get("interveningGuardrail") or body.get("type") or "unknown"),
+        str(message.get("actionReason") or "policy violation"),
+    )
+
+
 def _nonnegative_int(value: Any) -> int:
     try:
         return max(0, int(value))
@@ -219,11 +245,30 @@ def generate_gemini_response(question: str, source: str) -> tuple[str, int, int]
                     )
                 break
             assert response is not None
+            # A gateway guardrail rejects the call before it reaches the model
+            # (HTTP 422/403 with action GUARDRAIL_INTERVENED). Surface that as a
+            # policy block rather than as a model failure.
+            if 400 <= response.status_code < 500:
+                blocked = _guardrail_block(response)
+                if blocked is not None:
+                    raise GuardrailBlocked(*blocked)
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, dict):
                 raise ValueError("Gemini returned an invalid response")
             answer = _visible_gemini_text(body)
+        except GuardrailBlocked as exc:
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR, "guardrail blocked the request"))
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_attribute("app.guardrail", exc.guardrail or "unknown")
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Request blocked by the platform guardrail "
+                    f"'{exc.guardrail or 'unknown'}' ({exc.reason or 'policy violation'})."
+                ),
+            ) from exc
         except ModelUnavailable as exc:
             span.record_exception(exc)
             span.set_status(Status(StatusCode.ERROR, "managed model unavailable"))
